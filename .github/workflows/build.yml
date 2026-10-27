@@ -1,0 +1,126 @@
+name: Build for Esipher
+
+# Runs on every push (i.e. every time someone commits files here), and
+# can also be triggered manually from the Actions tab. If a .zip sits
+# at the repo root (the natural thing to drag in via GitHub's "Add
+# file -> Upload files", with no local unzipping needed), it's
+# extracted first. Either way, this then detects whichever of
+# npm/yarn/pnpm/bun the project uses, installs dependencies, runs its
+# build script, finds the resulting output folder, and uploads it as a
+# downloadable artifact — the zip you then upload to the Esipher
+# WordPress plugin.
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Extract uploaded export .zip, if any
+        id: source
+        run: |
+          zip_file=$(find . -maxdepth 1 -iname '*.zip' | head -1)
+
+          if [ -z "$zip_file" ]; then
+            echo "No .zip at the repo root — using the repo's files as-is."
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Found $zip_file — extracting..."
+          mkdir -p _export
+          unzip -q "$zip_file" -d _export
+
+          # Many exports (GitHub's own "Download ZIP" among them) wrap
+          # everything in a single top-level folder. Unwrap it so the
+          # steps below find package.json etc. directly, rather than
+          # one folder too deep — same idea as Esipher's own
+          # Source_Detector::resolve_root().
+          entry_count=$(find _export -mindepth 1 -maxdepth 1 | wc -l)
+
+          if [ "$entry_count" -eq 1 ]; then
+            only_entry=$(find _export -mindepth 1 -maxdepth 1)
+            if [ -d "$only_entry" ]; then
+              echo "dir=$only_entry" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "dir=_export" >> "$GITHUB_OUTPUT"
+
+      - name: Detect package manager
+        id: detect
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: |
+          if [ -f bun.lock ] || [ -f bun.lockb ]; then
+            manager=bun
+          elif [ -f pnpm-lock.yaml ]; then
+            manager=pnpm
+          elif [ -f yarn.lock ]; then
+            manager=yarn
+          else
+            manager=npm
+          fi
+          echo "Detected: $manager"
+          echo "manager=$manager" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: steps.detect.outputs.manager != 'bun'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up pnpm
+        if: steps.detect.outputs.manager == 'pnpm'
+        uses: pnpm/action-setup@v4
+
+      - name: Set up Bun
+        if: steps.detect.outputs.manager == 'bun'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install dependencies
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: |
+          case "${{ steps.detect.outputs.manager }}" in
+            npm)  npm install ;;
+            yarn) yarn install ;;
+            pnpm) pnpm install ;;
+            bun)  bun install ;;
+          esac
+
+      - name: Build
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: |
+          case "${{ steps.detect.outputs.manager }}" in
+            npm)  npm run build ;;
+            yarn) yarn build ;;
+            pnpm) pnpm build ;;
+            bun)  bun run build ;;
+          esac
+
+      - name: Locate build output
+        id: output
+        working-directory: ${{ steps.source.outputs.dir }}
+        run: |
+          for dir in dist build out .output/public; do
+            if [ -d "$dir" ]; then
+              echo "dir=$dir" >> "$GITHUB_OUTPUT"
+              echo "Found build output in: $dir"
+              exit 0
+            fi
+          done
+          echo "::error::No build output folder found (looked for dist/, build/, out/, .output/public/). Check the 'Build' step's log above for the actual error."
+          exit 1
+
+      - name: Upload build output
+        uses: actions/upload-artifact@v4
+        with:
+          name: esipher-build
+          path: ${{ steps.source.outputs.dir }}/${{ steps.output.outputs.dir }}
+          if-no-files-found: error
